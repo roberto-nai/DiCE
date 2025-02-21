@@ -1,6 +1,13 @@
 """
 Module to generate diverse counterfactual explanations based on genetic algorithm
 This code is similar to 'GeCo: Quality Counterfactual Explanations in Real Time': https://arxiv.org/pdf/2101.01292.pdf
+[2025-02-07]: added logging
+[2025-02-07]: added log_converter
+[2025-02-07]: added activity_origin_position, activity_origin_name as _generate_counterfactuals() parameter
+[2025-02-07]: added activity_origin_position, activity_origin_name as find_counterfactuals() parameter
+[2025-02-07]: Added activity_origin_position, activity_origin_name as compute_conformance_new() parameter.
+[2025-02-07]: Added penalty scores in compute_conformance_new().
+
 """
 import copy
 import random
@@ -22,6 +29,11 @@ from scipy.stats import median_abs_deviation
 
 import itertools
 from datetime import datetime
+
+import logging
+logger = logging.getLogger(__name__)
+from pm4py.objects.conversion.log import converter as log_converter 
+from utilities.dataframe_operations import find_activity_position_by_name
 
 class DiceGeneticConformance(ExplainerBase):
 
@@ -52,6 +64,7 @@ class DiceGeneticConformance(ExplainerBase):
         self.proximity_weight = proximity_weight
         self.sparsity_weight = sparsity_weight
         self.diversity_weight = diversity_weight
+        self.plausibility_weight = plausibility_weight
         self.categorical_penalty = categorical_penalty
         self.conformance_weight = conformance_weight
     def do_loss_initializations(self, yloss_type, diversity_loss_type, feature_weights,
@@ -246,7 +259,7 @@ class DiceGeneticConformance(ExplainerBase):
                                   yloss_type="hinge_loss", diversity_loss_type="dpp_style:inverse_dist",
                                   feature_weights="inverse_mad", stopping_threshold=0.25, posthoc_sparsity_param=0,
                                   posthoc_sparsity_algorithm="linear", maxiterations=50, thresh=1e-2, verbose=True,conformance_weight=3,
-                                  model_path=None,optimization=None,heuristic=None, random_seed=None,adapted=None):
+                                  model_path=None,optimization=None,heuristic=None, random_seed=None, adapted=None, activity_origin_position = None, activity_origin_name = None):
         """Generates diverse counterfactual explanations
 
         :param query_instance: A dictionary of feature names and values. Test point of interest.
@@ -283,10 +296,17 @@ class DiceGeneticConformance(ExplainerBase):
         :param thresh: The genetic algorithm stops when the difference between the previous best loss and current
                        best loss is less than thresh
         :param verbose: Parameter to determine whether to print 'Diverse Counterfactuals found!'
+        :param activity_origin_position: the position of the activity in the original log (to be compare with the position in the syntetic log)
+        :param activity_origin_name: the name of the activity in the original log (to be compare with the position in the syntetic log)
 
         :return: A CounterfactualExamples object to store and visualize the resulting counterfactual explanations
                  (see diverse_counterfactuals.py).
         """
+        logger.debug("_generate_counterfactuals")
+        logger.debug(f"total_CFs: {total_CFs}")
+        logger.debug(f"Activity original position received in _generate_counterfactuals: {activity_origin_position}")
+        logger.debug(f"Activity original name received in _generate_counterfactuals: {activity_origin_name}")
+        
         random.seed(random_seed)
         np.random.seed(random_seed)
         if not hasattr(self.data_interface, 'data_df') and initialization == "kdtree":
@@ -340,7 +360,7 @@ class DiceGeneticConformance(ExplainerBase):
 
         query_instance_df = self.find_counterfactuals(query_instance, desired_range, desired_class, features_to_vary,
                                                       maxiterations, thresh, verbose,encoder,dataset,model_path,d4py,optimization,
-                                                      heuristic,activities,activations,targets,adapted)
+                                                      heuristic,activities,activations,targets,adapted, activity_origin_position, activity_origin_name)
         ## change model given to this function
         return exp.CounterfactualExamples(data_interface=self.data_interface,
                                           test_instance_df=query_instance_df,
@@ -393,29 +413,34 @@ class DiceGeneticConformance(ExplainerBase):
 
         return predicted_values
 
-    def compute_plausibility(self,cfs=None, ratio_cont=None):
+    def compute_plausibility(self, cfs=None, ratio_cont=None):
         query_instance = self.x1
         continuous_features = self.data_interface.continuous_feature_names
         categorical_features = self.data_interface.categorical_feature_names
         dists = []
-        ratio_cont = len(continuous_features)/len(categorical_features)
+        ratio_cont = len(continuous_features) / len(categorical_features)
         X_y = self.data_interface.data_df
+        neigh_dist = self.distance_mh(query_instance=query_instance.reshape(1, -1), cf_list=X_y.to_numpy(), X=X_y)
+        idx_neigh = np.argsort(neigh_dist)[0][0]
+        closest = X_y.to_numpy()[idx_neigh]
         if cfs is None:
             cfs = self.cfs
-        for cf in cfs:
-            neigh_dist = self.distance_mh(query_instance=query_instance.reshape(1, -1), cf_list=cfs, X=X_y)
-            idx_neigh = np.argsort(neigh_dist)[0]
-            closest = X_y.to_numpy()[idx_neigh]
-            d = self.distance_mh(query_instance=cf.reshape(1, -1), cf_list=closest.reshape(1, -1), X=X_y)
-            dists.append(d)
+        dists = self.distance_mh(query_instance=closest.reshape(1, -1), cf_list=cfs, X=X_y)
         return np.array(dists)
-    #update here to not get confused
-    def distance_mh(self,query_instance, cf_list,X, ratio_cont=None, agg=None):
+
+    # update here to not get confused
+    def distance_mh(self, query_instance, cf_list, X, ratio_cont=None, agg=None):
         nbr_features = self.data_interface.number_of_features
         cont_feature_index = self.data_interface.continuous_feature_indexes
         cat_feature_index = self.data_interface.categorical_feature_indexes
-        dist_cont = self.continuous_distance(query_instance=query_instance, cf_list=cf_list, metric='mad', X=X, agg=agg)
-        dist_cate = self.categorical_distance(query_instance=query_instance, cf_list=cf_list, metric='hamming', agg=agg)
+        dist_cont = self.continuous_distance(query_instance=query_instance, cf_list=cf_list, metric='cityblock', X=X, agg=agg)
+        dist_cont =  dist_cont / len(query_instance[0])
+        try:
+            dist_cate = self.categorical_distance(query_instance=query_instance.astype('float64'), cf_list=cf_list,
+                                                  metric='hamming', agg=agg)
+        except:
+            dist_cate = self.categorical_distance(query_instance=query_instance.astype('float64'),
+                                                  cf_list=cf_list.astype('float64'), metric='hamming', agg=agg)
         if ratio_cont is None:
             ratio_continuous = len(cont_feature_index) / nbr_features
             ratio_categorical = len(cat_feature_index) / nbr_features
@@ -425,7 +450,7 @@ class DiceGeneticConformance(ExplainerBase):
         dist = ratio_continuous * dist_cont + ratio_categorical * dist_cate
         return dist
 
-    def continuous_distance(self,query_instance,cf_list, metric='euclidean', X=None, agg=None):
+    def continuous_distance(self, query_instance, cf_list, metric='cityblock', X=None, agg=None):
         cont_feature_index = self.data_interface.continuous_feature_indexes
         if metric == 'mad':
             mad = median_abs_deviation(X.iloc[:, cont_feature_index], axis=0)
@@ -433,31 +458,39 @@ class DiceGeneticConformance(ExplainerBase):
 
             def _mad_cityblock(u, v):
                 return mad_cityblock(u, v, mad)
-            dist = cdist(query_instance.reshape(1,-1)[:, cont_feature_index].astype('float'), cf_list[:, cont_feature_index].astype('float'), metric=_mad_cityblock)
-        else:
-            dist = cdist(query_instance.reshape(1,-1)[:, cont_feature_index].astype('float'), cf_list[:, cont_feature_index].astype('float'), metric=metric)
 
-        if agg is None or agg == 'mean':
+            dist = cdist(query_instance.reshape(1, -1)[:, cont_feature_index], cf_list[:, cont_feature_index],
+                         metric=_mad_cityblock)
+        else:
+            dist = cdist(query_instance.reshape(1, -1)[:, cont_feature_index].astype('float'), cf_list[:, cont_feature_index].astype('float'),
+                         metric=metric)
+
+        if agg == 'mean':
             return np.mean(dist)
 
-        if agg == 'max':
+        elif agg == 'max':
             return np.max(dist)
 
-        if agg == 'min':
+        elif agg == 'min':
             return np.min(dist)
+        else:
+            return dist
 
     def categorical_distance(self, query_instance, cf_list, metric='jaccard', agg=None):
         cat_feature_index = self.data_interface.categorical_feature_indexes
         dist = cdist(query_instance.reshape(1, -1)[:, cat_feature_index], cf_list[:, cat_feature_index], metric=metric)
 
-        if agg is None or agg == 'mean':
+        if agg == 'mean':
             return np.mean(dist)
 
-        if agg == 'max':
+        elif agg == 'max':
             return np.max(dist)
 
-        if agg == 'min':
+        elif agg == 'min':
             return np.min(dist)
+        else:
+            return dist
+
 
     def compute_yloss(self, cfs, desired_range, desired_class):
         """Computes the first part (y-loss) of the loss function."""
@@ -691,8 +724,22 @@ class DiceGeneticConformance(ExplainerBase):
         return one_init
     def find_counterfactuals(self, query_instance, desired_range, desired_class,
                              features_to_vary, maxiterations, thresh, verbose,encoder,dataset,model_path,d4py,optimization,
-                             heuristic,activities,activations,targets,adapted):
-        """Finds counterfactuals by generating cfs through the genetic algorithm"""
+                             heuristic,activities,activations,targets,adapted,activity_origin_position, activity_origin_name):
+        """
+        Finds counterfactuals by generating cfs through the genetic algorithm
+        
+        Args:
+            activity_origin_position: the position of the activity in the original log (to be compare with the position in the syntetic log)
+            activity_origin_name: the name of the activity in the original log (to be compare with the position in the syntetic log)
+        """
+
+        logger.debug("find_counterfactuals()")
+        logger.debug(f"optimization: {optimization}")
+        logger.debug(f"total_CFs: {self.total_CFs}")
+        logger.debug(f"maxiterations: {maxiterations}")
+        logger.debug(f"Activity original position received: {activity_origin_position}")
+        logger.debug(f"Activity original name received: {activity_origin_name}")
+
         population = self.cfs.copy()
         iterations = 0
         previous_best_loss = -np.inf
@@ -701,10 +748,11 @@ class DiceGeneticConformance(ExplainerBase):
         cfs_preds = [np.inf] * self.total_CFs
         to_pred = None
 
-
         self.query_instance_normalized = self.data_interface.normalize_data(self.x1)
         self.query_instance_normalized = self.query_instance_normalized.astype('float')
+
         while iterations < maxiterations and self.total_CFs > 0:
+            print("Iteration:", iterations)
             if abs(previous_best_loss - current_best_loss) <= thresh and \
                     (self.model.model_type == ModelTypes.Classifier and all(i == desired_class for i in cfs_preds) or
                      (self.model.model_type == ModelTypes.Regressor and
@@ -713,20 +761,13 @@ class DiceGeneticConformance(ExplainerBase):
             else:
                 stop_cnt = 0
             if stop_cnt >= 5:
+                print(f"Break {stop_cnt}")
                 break
             previous_best_loss = current_best_loss
-            population = np.unique(tuple(map(tuple, population)), axis=0)
+            population = np.unique(tuple(map(tuple, population)), axis=0) # the generated data
             ##TODO: Add conformance checking here before computing fitness
-            if optimization == 'baseline':
-                population_fitness = self.compute_baseline_loss(query_instance,population, desired_range, desired_class)
-            elif optimization == 'loss_function':
-                #self.conformance_score, population_conformance, query_conformance = self.compute_conformance(
-                #    query_instance, population, encoder, d4py)
-                self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder,d4py)
-                population_fitness = self.compute_loss(query_instance,population, desired_range, desired_class)
-            #elif (optimization == 'loss_function') & (iterations > 0) & (not adapted):
-
-
+            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder, d4py, activity_origin_position, activity_origin_name)
+            population_fitness = self.compute_loss(query_instance,population, desired_range, desired_class)
             population_fitness = population_fitness[population_fitness[:, 1].argsort()]
             current_best_loss = population_fitness[0][1]
             to_pred = np.array([population[int(tup[0])] for tup in population_fitness[:self.total_CFs]])
@@ -768,10 +809,13 @@ class DiceGeneticConformance(ExplainerBase):
             else:
                 raise SystemError("The number of total_Cfs is greater than the population size!")
             iterations += 1
+        
+        logger.debug(f"Total iterations: {iterations}")
+
         if optimization == 'filtering':
             #self.conformance_score, population_conformance, query_conformance = self.compute_conformance(
             #    query_instance, population, encoder, d4py)
-            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder,d4py)
+            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder,d4py, activity_origin_position, activity_origin_name)
             population = population[self.conformance_score > 0.99]
 
         self.cfs_preds = []
@@ -793,7 +837,7 @@ class DiceGeneticConformance(ExplainerBase):
             i += 1
 
         # converting to dataframe
-       #query_instance_df = self.label_decode(query_instance)
+        #query_instance_df = self.label_decode(query_instance)
         query_instance_df = pd.DataFrame(query_instance,columns=self.data_interface.feature_names)
         query_instance_df[self.data_interface.outcome_name] = self.test_pred
         self.final_cfs_df = pd.DataFrame(self.final_cfs, columns=self.data_interface.feature_names)
@@ -816,6 +860,9 @@ class DiceGeneticConformance(ExplainerBase):
                       'Diverse Counterfactuals found for the given configuation, perhaps ',
                       'change the query instance or the features to vary...'  '; total time taken: %02d' % m,
                       'min %02d' % s, 'sec')
+        
+        # print("query_instance_df")
+        # print(query_instance_df.head()) # debug
 
         return query_instance_df
 
@@ -944,12 +991,15 @@ class DiceGeneticConformance(ExplainerBase):
         query_instance_to_decode.insert(loc=1, column='label', value=1)
         long_query_instance = pd.wide_to_long(query_instance_to_decode, stubnames=['prefix'], i='Case ID',
                                               j='order', sep='_', suffix=r'\w+')
+
         long_query_instance_sorted = long_query_instance.sort_values(['Case ID', 'order'], ).reset_index(drop=False)
         columns_to_rename = {'Case ID': 'case:concept:name', 'prefix': 'concept:name'}
+        timestamps = pd.date_range('1/1/2011', periods=len(long_query_instance), freq='H')
+        long_query_instance_sorted['time:timestamp'] = timestamps
         long_query_instance_sorted.rename(columns=columns_to_rename, inplace=True)
         long_query_instance_sorted['label'].replace({'regular': 'false', 'deviant': 'true'}, inplace=True)
         long_query_instance_sorted.replace('0', 'other', inplace=True)
-        long_query_instance_sorted['Case ID']=long_query_instance_sorted['Case ID'].astype(str)
+        long_query_instance_sorted['case:concept:name']=long_query_instance_sorted['case:concept:name'].astype(str)
         query_log = pm4py.convert_to_event_log(long_query_instance_sorted)
         d4py.load_xes_log(query_log)
         model_check_query = d4py.conformance_checking(consider_vacuity=False)
@@ -979,7 +1029,16 @@ class DiceGeneticConformance(ExplainerBase):
         d4py.model.checkers = [d4py.model.checkers[i] for i in indexes]
         d4py.model.constraints = updated_constraints
 
-    def compute_conformance_new(self, population, encoder, d4py):
+    def compute_conformance_new(self, population, encoder, d4py, activity_origin_position, activity_origin_name):
+        """
+        Args:
+            activity_origin_position: the position of the activity in the original log (to be compare with the position in the syntetic log)
+            activity_origin_name: the name of the activity in the original log (to be compare with the position in the syntetic log)
+        """
+        logger.debug("compute_conformance_new()")
+        logger.debug(f"Activity original position received: {activity_origin_position}")
+        logger.debug(f"Activity original name received: {activity_origin_name}")
+        
         population_df = pd.DataFrame(population, columns=self.data_interface.feature_names)
         encoder.decode(population_df)
         population_df.insert(loc=0, column='Case ID', value=np.divmod(np.arange(len(population_df)), 1)[0] + 1)
@@ -995,9 +1054,20 @@ class DiceGeneticConformance(ExplainerBase):
         long_data_sorted.rename(columns=columns_to_rename, inplace=True)
         long_data_sorted['label'].replace({'regular': 'false', 'deviant': 'true'}, inplace=True)
         long_data_sorted.replace('0', 'other', inplace=True)
+        long_data_sorted['case:concept:name'] = long_data_sorted['case:concept:name'].astype(str)
         event_log = pm4py.convert_to_event_log(long_data_sorted)
         d4py.load_xes_log(event_log)
         model_check_res = d4py.conformance_checking(consider_vacuity=False)
+
+        # [2025-02-07]: added log_converter
+        event_log_df = log_converter.apply(event_log, variant=log_converter.Variants.TO_DATA_FRAME) 
+        # print(event_log_df.head())
+        event_log_df.to_csv("test.csv", sep=";", index=False)
+        # print("--")
+        
+        cases_num = event_log_df["case:concept:name"].nunique()
+        cases_list = event_log_df["case:concept:name"].unique()
+        print(f"Distinct cases ({cases_num}): {cases_list}")
 
         model_check_res_filter = {
             k: {
@@ -1007,7 +1077,39 @@ class DiceGeneticConformance(ExplainerBase):
             }
             for k, v in model_check_res.items()
         }
+
         conformance_score = np.array([len(v) / len(model_check_res.get(k).values()) for k,v in model_check_res_filter.items()])
+        print(f"conformance_score *old* ({len(conformance_score)}): {conformance_score}")
+
+        ###
+        # New version of the conformance score: for each case-id, check te position of the activity_origin_name
+        # Punish the conformance score by a X percentage if:
+        # 1. the target activity in the generated trace is in the same location as the inquiry trace
+        # 2. the target activity does not exist in the generated traces
+        ###
+
+        case_column = "case:concept:name"
+        for i, case_value in enumerate(cases_list):
+            punish = 0
+            df_synth_filtered = event_log_df[event_log_df[case_column] == case_value]
+            # task: find the activity_origin_name and its position in df_filtered
+            print("--")
+            print(f"Updating conformance score of position {i}")
+            activity_synth_position = find_activity_position_by_name(df_synth_filtered, "concept:name", activity_origin_name)
+            print(f"Activity '{activity_origin_name}' new syntetic position: {activity_synth_position}")
+            if activity_origin_position == activity_synth_position:
+                print(f"Activity original position {activity_origin_position} and synthetic positions are same {activity_synth_position}")
+                punish = 0.2
+            if activity_synth_position == -1:
+                print(f"Activity original position {activity_origin_position} but synthetic positions not found {activity_synth_position}")
+                punish = 0.2
+
+            conformance_score[i] -= punish
+
+            print(f"conformance_score *new* ({len(conformance_score)}): {conformance_score}")
+
+        # quit()
+
         return conformance_score, model_check_res
 
 def mad_cityblock(u, v, mad):
