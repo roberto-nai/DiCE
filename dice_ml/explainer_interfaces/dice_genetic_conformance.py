@@ -3,10 +3,10 @@ Module to generate diverse counterfactual explanations based on genetic algorith
 This code is similar to 'GeCo: Quality Counterfactual Explanations in Real Time': https://arxiv.org/pdf/2101.01292.pdf
 [2025-02-07]: added logging
 [2025-02-07]: added log_converter
-[2025-02-07]: added activity_origin_position, activity_origin_name as _generate_counterfactuals() parameter
-[2025-02-07]: added activity_origin_position, activity_origin_name as find_counterfactuals() parameter
-[2025-02-07]: Added activity_origin_position, activity_origin_name as compute_conformance_new() parameter.
-[2025-02-07]: Added penalty scores in compute_conformance_new().
+[2025-02-07]: added activity_origin_position, activity_origin_name, conformance_penalty as _generate_counterfactuals() parameter
+[2025-02-07]: added activity_origin_position, activity_origin_name, conformance_penalty as find_counterfactuals() parameter
+[2025-02-07]: Added activity_origin_position, activity_origin_name, conformance_penalty as compute_conformance_new() parameter.
+[2025-02-07]: Added penalty scores (conformance_penalty) in compute_conformance_new().
 
 """
 import copy
@@ -259,7 +259,7 @@ class DiceGeneticConformance(ExplainerBase):
                                   yloss_type="hinge_loss", diversity_loss_type="dpp_style:inverse_dist",
                                   feature_weights="inverse_mad", stopping_threshold=0.25, posthoc_sparsity_param=0,
                                   posthoc_sparsity_algorithm="linear", maxiterations=50, thresh=1e-2, verbose=True,conformance_weight=3,
-                                  model_path=None,optimization=None,heuristic=None, random_seed=None, adapted=None, activity_origin_position = None, activity_origin_name = None):
+                                  model_path=None,optimization=None,heuristic=None, random_seed=None, adapted=None, activity_origin_position = None, activity_origin_name = None, conformance_penalty = None):
         """Generates diverse counterfactual explanations
 
         :param query_instance: A dictionary of feature names and values. Test point of interest.
@@ -306,6 +306,7 @@ class DiceGeneticConformance(ExplainerBase):
         logger.debug(f"total_CFs: {total_CFs}")
         logger.debug(f"Activity original position received in _generate_counterfactuals: {activity_origin_position}")
         logger.debug(f"Activity original name received in _generate_counterfactuals: {activity_origin_name}")
+        logger.debug(f"Conformance penalty received in _generate_counterfactuals: {conformance_penalty}")
         
         random.seed(random_seed)
         np.random.seed(random_seed)
@@ -360,7 +361,7 @@ class DiceGeneticConformance(ExplainerBase):
 
         query_instance_df = self.find_counterfactuals(query_instance, desired_range, desired_class, features_to_vary,
                                                       maxiterations, thresh, verbose,encoder,dataset,model_path,d4py,optimization,
-                                                      heuristic,activities,activations,targets,adapted, activity_origin_position, activity_origin_name)
+                                                      heuristic,activities,activations,targets,adapted, activity_origin_position, activity_origin_name, conformance_penalty)
         ## change model given to this function
         return exp.CounterfactualExamples(data_interface=self.data_interface,
                                           test_instance_df=query_instance_df,
@@ -724,7 +725,7 @@ class DiceGeneticConformance(ExplainerBase):
         return one_init
     def find_counterfactuals(self, query_instance, desired_range, desired_class,
                              features_to_vary, maxiterations, thresh, verbose,encoder,dataset,model_path,d4py,optimization,
-                             heuristic,activities,activations,targets,adapted,activity_origin_position, activity_origin_name):
+                             heuristic,activities,activations,targets,adapted,activity_origin_position, activity_origin_name, conformance_penalty):
         """
         Finds counterfactuals by generating cfs through the genetic algorithm
         
@@ -739,6 +740,7 @@ class DiceGeneticConformance(ExplainerBase):
         logger.debug(f"maxiterations: {maxiterations}")
         logger.debug(f"Activity original position received: {activity_origin_position}")
         logger.debug(f"Activity original name received: {activity_origin_name}")
+        logger.debug(f"Conformance penalty: {conformance_penalty}")
 
         population = self.cfs.copy()
         iterations = 0
@@ -766,7 +768,7 @@ class DiceGeneticConformance(ExplainerBase):
             previous_best_loss = current_best_loss
             population = np.unique(tuple(map(tuple, population)), axis=0) # the generated data
             ##TODO: Add conformance checking here before computing fitness
-            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder, d4py, activity_origin_position, activity_origin_name)
+            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder, d4py, activity_origin_position, activity_origin_name, conformance_penalty)
             population_fitness = self.compute_loss(query_instance,population, desired_range, desired_class)
             population_fitness = population_fitness[population_fitness[:, 1].argsort()]
             current_best_loss = population_fitness[0][1]
@@ -815,7 +817,7 @@ class DiceGeneticConformance(ExplainerBase):
         if optimization == 'filtering':
             #self.conformance_score, population_conformance, query_conformance = self.compute_conformance(
             #    query_instance, population, encoder, d4py)
-            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder,d4py, activity_origin_position, activity_origin_name)
+            self.conformance_score, population_conformance = self.compute_conformance_new(population, encoder,d4py, activity_origin_position, activity_origin_name, conformance_penalty)
             population = population[self.conformance_score > 0.99]
 
         self.cfs_preds = []
@@ -1029,11 +1031,12 @@ class DiceGeneticConformance(ExplainerBase):
         d4py.model.checkers = [d4py.model.checkers[i] for i in indexes]
         d4py.model.constraints = updated_constraints
 
-    def compute_conformance_new(self, population, encoder, d4py, activity_origin_position, activity_origin_name):
+    def compute_conformance_new(self, population, encoder, d4py, activity_origin_position, activity_origin_name, conformance_penalty):
         """
         Args:
             activity_origin_position: the position of the activity in the original log (to be compare with the position in the syntetic log)
             activity_origin_name: the name of the activity in the original log (to be compare with the position in the syntetic log)
+            conformance_penalty: the penalty to be applied
         """
         logger.debug("compute_conformance_new()")
         logger.debug(f"Activity original position received: {activity_origin_position}")
@@ -1099,10 +1102,10 @@ class DiceGeneticConformance(ExplainerBase):
             print(f"Activity '{activity_origin_name}' new syntetic position: {activity_synth_position}")
             if activity_origin_position == activity_synth_position:
                 print(f"Activity original position {activity_origin_position} and synthetic positions are same {activity_synth_position}")
-                punish = 0.2
+                punish = conformance_penalty
             if activity_synth_position == -1:
                 print(f"Activity original position {activity_origin_position} but synthetic positions not found {activity_synth_position}")
-                punish = 0.2
+                punish = conformance_penalty
 
             conformance_score[i] -= punish
 
